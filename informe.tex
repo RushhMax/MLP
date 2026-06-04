@@ -1,0 +1,641 @@
+% ============================================================
+\section{Introducción}
+% ============================================================
+
+Ambas implementaciones comparten la misma base algorítmica
+y soportan:
+
+\begin{itemize}[noitemsep]
+    \item Activaciones intercambiables: \textbf{ReLU}, \textbf{Leaky ReLU}, \textbf{Sigmoid}, \textbf{Tanh}, \textbf{Softmax}
+    \item Funciones de pérdida: \textbf{Cross-Entropy} y \textbf{MSE}
+    \item Inicialización de pesos: estrategias \textbf{He} y \textbf{Xavier}
+    \item Optimizadores: \textbf{SGD} estocástico y \textbf{Adam}
+    \item Mezcla aleatoria (\textit{shuffle}) del conjunto de entrenamiento por época
+    \item Datasets: \textbf{MNIST} (dígitos) y \textbf{Simpsons MNIST} (imágenes PNG a color)
+\end{itemize}
+
+% ============================================================
+\section{Fundamentos Teóricos}
+% ============================================================
+
+\subsection{Arquitectura del MLP}
+
+Un Perceptrón Multicapa es una red neuronal artificial compuesta por una capa de entrada,
+una o más capas ocultas y una capa de salida. Cada neurona $j$ de la capa $l$ computa:
+
+\begin{equation}
+    z_j^{[l]} = \sum_{i} w_{ij}^{[l]} \cdot a_i^{[l-1]} + b_j^{[l]}
+    \qquad \longrightarrow \qquad
+    a_j^{[l]} = g\!\left(z_j^{[l]}\right)
+\end{equation}
+
+donde $g(\cdot)$ es la función de activación. En forma matricial compacta:
+
+\begin{equation}
+    \mathbf{z}^{[l]} = \left(W^{[l]}\right)^T \mathbf{a}^{[l-1]},
+    \qquad
+    \mathbf{a}^{[l]} = g\!\left(\mathbf{z}^{[l]}\right)
+\end{equation}
+
+\subsection{Truco del Sesgo (\textit{Bias Augmentation})}
+
+En lugar de mantener vectores de sesgo independientes, ambas implementaciones fusionan el
+sesgo con los pesos añadiendo una fila extra a la matriz $W^{[l]}$ y una componente fija
+$a_0 = 1$ al vector de activación. Esto reduce el cómputo a una única multiplicación
+matricial:
+
+\begin{equation}
+    \text{dim}(W^{[l]}) = (N_l + 1) \times N_{l+1}
+    \qquad \tilde{\mathbf{a}}^{[l]} = \begin{bmatrix}1 \\ \mathbf{a}^{[l]}\end{bmatrix}
+\end{equation}
+
+\subsection{Funciones de Activación}
+
+Las funciones de activación introducen la no-linealidad necesaria en las redes neuronales para que estas puedan aproximar funciones complejas y resolver problemas no lineales.
+
+\subsubsection{ReLU (Rectified Linear Unit)}
+
+La función ReLU es el estándar \textit{de facto} en las capas ocultas de las redes neuronales profundas debido a su simplicidad computacional y su eficiencia para mitigar el desvanecimiento del gradiente.
+
+\begin{equation}
+    f(z) = \max(0,\,z), \quad \text{con derivada} \quad f'(z) = \mathbb{I}(z>0) = \begin{cases} 1 & \text{si } z > 0 \\ 0 & \text{si } z < 0 \end{cases}
+\end{equation}
+
+\begin{itemize}
+    \item \textbf{Propiedades del Gradiente:} Para cualquier valor positivo ($z > 0$), la derivada es una constante igual a $1$. Esto permite que el gradiente fluya hacia atrás durante el \textit{backpropagation} sin ser atenuado, acelerando drásticamente la convergencia del descenso de gradiente.
+    \item \textbf{No-diferenciabilidad:} En el punto exacto $z = 0$, la función no es diferenciable. En la práctica computacional, esto se resuelve utilizando un \textit{subgradiente}, asignando arbitrariamente $f'(0) = 0$ o $f'(0) = 1$, lo cual no afecta negativamente el entrenamiento.
+    \item \textbf{El Problema del ReLU Muerto (\textit{Dying ReLU}):} Si un flujo de gradientes muy grande actualiza los sesgos (\textit{biases}) de un nodo de tal forma que la pre-activación $z$ se vuelve siempre negativa para todo el conjunto de datos, la salida será permanentemente $0$ y su gradiente será $0$. Esta neurona queda inactivada de forma irreversible ("muere") y deja de aprender.
+\end{itemize}
+
+\subsubsection{Leaky ReLU}
+
+Diseñada específicamente como una extensión directa de la ReLU para solucionar el problema del "Dying ReLU".
+
+\begin{equation}
+    f(z) = \max(\alpha z,\,z), \quad \text{donde } 0 < \alpha \ll 1 
+\end{equation}
+La función del gradiente está definida mediante la función indicadora $\mathbb{I}$:
+\begin{equation}
+    f'(z) = \mathbb{I}(z>0) + \alpha\,\mathbb{I}(z\le 0) = \begin{cases} 1 & \text{si } z > 0 \\ \alpha & \text{si } z \le 0 \end{cases}
+\end{equation}
+
+\begin{itemize}
+    \item \textbf{Flujo Continuo de Gradiente:} Al introducir una pequeña pendiente constante $\alpha$ (típicamente $\alpha = 0.01$) en la zona negativa, se garantiza que incluso las neuronas inactivas retengan un gradiente pequeño pero diferente de cero. Esto previene que las neuronas mueran y permite que se recuperen durante el entrenamiento.
+    \item \textbf{Costo Computacional:} Mantiene casi la misma eficiencia que la ReLU original, requiriendo únicamente una operación de comparación y una multiplicación escalar elemental.
+\end{itemize}
+
+\subsubsection{Sigmoid (Sigmoide)}
+
+Históricamente popular, la función sigmoide mapea el espacio de números reales al rango acotado e interpretable de probabilidades $(0, 1)$.
+
+\begin{equation}
+    \sigma(z) = \frac{1}{1+e^{-z}}
+\end{equation}
+Una de sus mayores ventajas algebraicas es el costo de su diferenciación, ya que su derivada se puede expresar en términos de su propia salida:
+\begin{equation}
+    \sigma'(z) = \sigma(z)(1-\sigma(z))
+\end{equation}
+
+\begin{itemize}
+    \item \textbf{Desvanecimiento del Gradiente (\textit{Vanishing Gradient}):} Cuando las entradas $z$ toman valores muy grandes o muy pequeños (zonas de saturación), la curva se aplana. Como se observa en la derivada, cuando $\sigma(z) \to 1$ o $\sigma(z) \to 0$, entonces $\sigma'(z) \to 0$. Al encadenar múltiples capas con esta propiedad, el gradiente se multiplica por valores fraccionarios infinitesimales y se desvanece antes de llegar a las capas iniciales.
+    \item \textbf{No Centrada en Cero:} Las salidas de la sigmoide son siempre positivas. Esto provoca que los gradientes de los pesos asociados a una neurona tengan siempre el mismo signo durante el \textit{backpropagation}, introduciendo oscilaciones indeseadas (patrón en zigzag) en la optimización.
+\end{itemize}
+
+
+\subsubsection{Softmax}
+
+A diferencia de las funciones anteriores que operan de forma escalar elemento a elemento, Softmax opera sobre un vector completo $z \in \mathbb{R}^K$ para transformarlo en una distribución de probabilidad categórica donde $\sum_k s_k(z) = 1$.
+
+\begin{equation}
+    s_k(z) = \frac{e^{z_k - \max z}}{\sum_j e^{z_j - \max z}}
+\end{equation}
+
+\begin{itemize}
+    \item \textbf{Mapeo Interdependiente:} La probabilidad de cada clase $k$ depende de la magnitud relativa de su pre-activación $z_k$ frente a la suma de todas las demás pre-activaciones del vector. Se utiliza exclusivamente en la capa de salida para tareas de clasificación multiclase.
+    \item \textbf{Maximización de Márgenes:} Debido a la naturaleza exponencial, Softmax tiende a acentuar fuertemente la diferencia entre el valor máximo y los demás valores del vector, asignando casi toda la masa de probabilidad a la predicción más segura.
+\end{itemize}
+
+\subsection{Funciones de Pérdida}
+
+Las funciones de pérdida cuantifican la discrepancia entre las predicciones del modelo ($\hat{y}$) y las etiquetas reales u objetivos ($y$). Su optimización mediante el descenso de gradiente permite ajustar los parámetros de la red.
+
+\subsubsection{Entropía Cruzada Categórica (\textit{Categorical Cross-Entropy})}
+
+Esta función se utiliza exclusivamente en problemas de clasificación multiclase donde las clases son mutuamente excluyentes, y se acopla de forma casi universal con la capa de salida Softmax.
+
+\begin{equation}
+    \mathcal{L}_{CE} = -\sum_{k=1}^K y_k \log\left(\hat{y}_k + \varepsilon\right)
+\end{equation}
+
+Donde $K$ es el número total de clases, $y_k$ es la etiqueta real en formato \textit{one-hot encoding} (un $1$ en la clase correcta y $0$ en las demás), $\hat{y}_k$ es la probabilidad predicha por Softmax, y $\varepsilon$ (un valor infinitesimal como $10^{-7}$) es un término de estabilidad que previene calcular $\log(0)$, lo cual colapsaría el sistema con un error matemático indefinido.
+ 
+ \textbf{Mecanismo de Penalización:} 
+Dado que $y_k$ es $0$ para todas las clases incorrectas, la pérdida se reduce a evaluar únicamente el logaritmo de la clase correcta: $-\log(\hat{y}_{\text{correcta}})$. 
+\begin{itemize}
+    \item Si la red predice una probabilidad cercana a $1$ para la clase correcta, $-\log(1) \to 0$, por lo que la pérdida es mínima.
+    \item Si la red predice una probabilidad cercana a $0$ para la clase correcta, $-\log(0) \to \infty$, aplicando una penalización extremadamente severa al modelo.
+\end{itemize}
+
+\subsubsection{Error Cuadrático Medio (\textit{Mean Squared Error} - MSE)}
+
+El Error Cuadrático Medio es la función de pérdida por excelencia para problemas de regresión, donde el objetivo es predecir un valor numérico continuo (como el precio de una vivienda o la temperatura) en lugar de una categoría discreta.
+
+\begin{equation}
+    \mathcal{L}_{MSE} = \frac{1}{2N}\sum_{i=1}^N \left(\hat{y}_i - y_i\right)^2
+\end{equation}
+
+Donde $N$ representa el número de muestras en el lote de datos (\textit{batch size}), $y_i$ es el valor real y $\hat{y}_i$ es la predicción continua de la red. El factor constante $\frac{1}{2}$ se introduce intencionalmente por conveniencia algebraica, para que al derivar se cancele con el exponente cuadrático.
+
+Al calcular la derivada respecto a las predicciones obtenemos:
+\begin{equation}
+    \frac{\partial \mathcal{L}_{MSE}}{\partial \hat{y}} = \frac{\hat{y} - y}{N}
+\end{equation}
+
+\textbf{Propiedades Clave:}
+\begin{itemize}
+    \item \textbf{Sensibilidad a Valores Atípicos (\textit{Outliers}):} Debido a que los errores se elevan al cuadrado, las discrepancias grandes se penalizan de forma desproporcionada en comparación con los errores pequeños. Por ejemplo, un error de $4$ unidades aporta $16$ a la pérdida, mientras que un error de $2$ unidades aporta solo $4$. Esto empuja al modelo a priorizar la corrección de las peores predicciones, aunque lo hace vulnerable a datos ruidosos o atípicos.
+    \item \textbf{Estabilización del Gradiente:} A medida que el modelo se acerca al valor real ($\hat{y} \to y$), la diferencia se reduce, provocando que el gradiente sea cada vez más pequeño. Esto permite que la red realice actualizaciones de pesos muy finas y precisas al final del entrenamiento, logrando una convergencia suave hacia el mínimo local sin oscilar bruscamente.
+\end{itemize}
+
+\subsection{Inicialización de Pesos}
+
+Una mala inicialización de los pesos puede provocar que las señales se amplifiquen o atenúen exponencialmente a medida que atraviesan las capas de la red, haciendo que el entrenamiento converja lentamente o diverja por completo. Ambas estrategias parten del mismo principio: los pesos deben muestrearse de una distribución normal con media cero y una desviación estándar cuidadosamente calibrada en función del número de neuronas en la capa anterior.
+
+\subsubsection{Inicialización de Xavier (\textit{Glorot Initialization})}
+
+Propuesta por Glorot y Bengio (2010), esta estrategia fue derivada bajo el supuesto de que las funciones de activación son aproximadamente lineales en torno al origen, lo que la hace idónea para \textbf{Sigmoid} y \textbf{Tanh}. Su objetivo es que la varianza de las activaciones se mantenga constante a lo largo de todas las capas, tanto en el paso hacia adelante como en la retropropagación.
+
+Partiendo de la condición $\operatorname{Var}(a^{[l]}) = \operatorname{Var}(a^{[l-1]})$, se puede demostrar que la varianza de cada peso debe ser inversamente proporcional al número de entradas a la neurona $N_{\text{in}}$:
+
+\begin{equation}
+    w \sim \mathcal{N}\!\left(0,\;\sigma^2_X\right), \qquad \sigma_X = \sqrt{\frac{1}{N_{\text{in}}}}
+\end{equation}
+
+La formulación simétrica (que considera también el número de salidas $N_{\text{out}}$) promedia ambas condiciones:
+
+\begin{equation}
+    \sigma_X = \sqrt{\frac{2}{N_{\text{in}} + N_{\text{out}}}}
+\end{equation}
+
+Las implementaciones del proyecto utilizan la versión simplificada $\sqrt{1/N_{\text{in}}}$, equivalente cuando $N_{\text{in}} \approx N_{\text{out}}$.
+
+\begin{itemize}
+    \item \textbf{Preservación de la Varianza:} Al escalar los pesos con $\sqrt{1/N_{\text{in}}}$, la varianza de la pre-activación $z^{[l]} = \sum_{i} w_i a_i^{[l-1]}$ se mantiene en torno a $1$ independientemente del ancho de la capa, evitando tanto la explosión como el desvanecimiento de la señal.
+    \item \textbf{Incompatibilidad con ReLU:} Dado que ReLU anula todas las activaciones negativas, en la práctica elimina aproximadamente la mitad de la contribución a la varianza. Esto hace que la varianza de la salida sea la mitad de la esperada, rompiendo la condición sobre la que fue derivado el método y provocando un desvanecimiento progresivo en redes profundas con ReLU.
+\end{itemize}
+
+\subsubsection{Inicialización de He (\textit{Kaiming Initialization})}
+
+Propuesta por He et al.\ (2015), esta estrategia corrige explícitamente la incompatibilidad de Xavier con la función ReLU. Al observar que ReLU descarta en promedio la mitad de las activaciones (las negativas), su análisis muestra que el factor de escala debe duplicarse para compensar esa pérdida de varianza:
+
+\begin{equation}
+    w \sim \mathcal{N}\!\left(0,\;\sigma^2_H\right), \qquad \sigma_H = \sqrt{\frac{2}{N_{\text{in}}}}
+\end{equation}
+
+La justificación emerge del cálculo de varianza sobre la capa $l$. Sea $w_{ij}^{[l]}$ i.i.d.\ con media cero y varianza $\sigma^2$, y sea $a_i^{[l-1]} = \text{ReLU}(z_i^{[l-1]})$:
+
+\begin{equation}
+    \operatorname{Var}\!\left(z_j^{[l]}\right)
+    = N_{\text{in}} \cdot \sigma^2 \cdot \operatorname{Var}\!\left(a_i^{[l-1]}\right)
+    \approx N_{\text{in}} \cdot \sigma^2 \cdot \frac{1}{2}\operatorname{Var}\!\left(z_i^{[l-1]}\right)
+\end{equation}
+
+Para que la varianza no cambie entre capas ($\operatorname{Var}(z^{[l]}) = \operatorname{Var}(z^{[l-1]})$) se requiere $N_{\text{in}} \cdot \sigma^2 \cdot \tfrac{1}{2} = 1$, lo que conduce directamente a $\sigma^2 = 2/N_{\text{in}}$.
+
+\begin{itemize}
+    \item \textbf{Factor 2 Explicado:} El coeficiente $2$ en el numerador compensa exactamente la mitad de activaciones que ReLU anula en cada capa, manteniendo la energía de la señal estable en redes arbitrariamente profundas.
+    \item \textbf{Compatibilidad con Leaky ReLU:} Para Leaky ReLU con pendiente $\alpha$ en la zona negativa, la corrección generalizada es $\sigma_H = \sqrt{2/(1+\alpha^2) \cdot N_{\text{in}}}$. Dado que $\alpha = 0.01 \approx 0$, el factor se reduce prácticamente a $\sqrt{2/N_{\text{in}}}$, por lo que ambas implementaciones utilizan la misma escala He para ReLU y Leaky ReLU.
+    \item \textbf{Aceleración de la Convergencia:} Al garantizar que las activaciones y los gradientes tengan varianza unitaria a través de todas las capas desde el inicio del entrenamiento, el descenso de gradiente opera sobre una superficie de pérdida mejor condicionada, reduciendo el número de épocas necesarias para converger.
+\end{itemize}
+
+\subsection{Retropropagación}
+
+El algoritmo de retropropagación calcula los gradientes de la pérdida respecto a cada peso
+aplicando la regla de la cadena de forma recursiva desde la capa de salida hacia la entrada:
+
+\begin{align}
+    \boldsymbol{\delta}^{[L]} &= \frac{\partial \mathcal{L}}{\partial \mathbf{z}^{[L]}} \\[4pt]
+    \boldsymbol{\delta}^{[l]} &= \left(W^{[l+1]}_{\text{sin bias}}\right)\boldsymbol{\delta}^{[l+1]}
+                                  \odot f'\!\left(\mathbf{z}^{[l]}\right) \\[4pt]
+    \nabla_{W^{[l]}} \mathcal{L} &= \tilde{\mathbf{a}}^{[l-1]} \cdot \left(\boldsymbol{\delta}^{[l]}\right)^T
+\end{align}
+
+El \textit{slicing} que excluye la fila del sesgo en $W^{[l+1]}$ es esencial para no
+propagar el gradiente hacia el nodo ficticio de bias.
+
+\subsection{Optimizadores}
+
+\textbf{SGD estocástico:}
+\begin{equation}
+    W^{[l]} \leftarrow W^{[l]} - \eta \cdot \nabla_{W^{[l]}} \mathcal{L}
+\end{equation}
+
+\textbf{Adam} (Adaptive Moment Estimation):
+\begin{align}
+    m_t &= \beta_1 m_{t-1} + (1-\beta_1)\,g_t \\
+    v_t &= \beta_2 v_{t-1} + (1-\beta_2)\,g_t^2 \\
+    \hat{m}_t &= \frac{m_t}{1-\beta_1^t}, \quad \hat{v}_t = \frac{v_t}{1-\beta_2^t} \\
+    W^{[l]} &\leftarrow W^{[l]} - \eta\,\frac{\hat{m}_t}{\sqrt{\hat{v}_t}+\varepsilon}
+\end{align}
+
+con valores por defecto $\beta_1=0.9$, $\beta_2=0.999$, $\varepsilon=10^{-8}$.
+
+% ============================================================
+\section{Implementación en Python}
+% ============================================================
+
+\subsection{Estructura General}
+
+El archivo \texttt{MLP.py} está organizado en cuatro bloques independientes:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Activaciones} --- clases estáticas (\texttt{ReLU}, \texttt{LeakyReLU}, \texttt{Sigmoid}, \texttt{Tanh}, \texttt{Softmax})
+    \item \textbf{Pérdidas} --- clases estáticas (\texttt{MSE}, \texttt{CrossEntropy})
+    \item \textbf{RedNeuronal} --- clase principal con forward, backward y entrenamiento
+    \item \textbf{VisualizadorRedNeuronal} --- visualización con \texttt{matplotlib}
+\end{enumerate}
+
+\subsection{Inicialización Paramétrica}
+
+El constructor acepta la topología como lista de enteros y dos parámetros adicionales que
+no existían en la versión original:
+
+\begin{lstlisting}[style=python, caption={Constructor de RedNeuronal}]
+def __init__(self, capas, activaciones, perdida="mse",
+             init="he", optimizer="sgd"):
+    ...
+    for i in range(len(capas) - 1):
+        esc = (np.sqrt(2.0 / capas[i]) if init == "he"
+               else np.sqrt(1.0 / capas[i]))  # Xavier
+
+        w = np.random.randn(capas[i] + 1, capas[i + 1]) * esc
+        self.pesos.append(w)
+        self.m_w.append(np.zeros_like(w))   # momentos Adam
+        self.v_w.append(np.zeros_like(w))
+\end{lstlisting}
+
+La \textbf{Inicialización de He} ($\sqrt{2/N_i}$) estabiliza la varianza de gradientes en
+redes con ReLU. La \textbf{Xavier} ($\sqrt{1/N_i}$) es preferible para Sigmoid/Tanh.
+Los momentos $m_w$ y $v_w$ se inicializan en cero y solo se usan cuando
+\texttt{optimizer="adam"}.
+
+\subsection{Funciones de Activación}
+
+Cada activación se implementa como una clase con métodos estáticos \texttt{forward} y
+\texttt{derivative}, agrupadas en el diccionario \texttt{ACTIVACIONES} para seleccionarlas
+dinámicamente por nombre de cadena:
+
+\begin{lstlisting}[style=python, caption={Leaky ReLU (nueva respecto a versión original)}]
+class LeakyReLU:
+    @staticmethod
+    def forward(x, alpha=0.01):
+        return np.where(x > 0, x, alpha * x)
+
+    @staticmethod
+    def derivative(x, alpha=0.01):
+        return np.where(x > 0, 1.0, alpha)
+\end{lstlisting}
+
+\begin{lstlisting}[style=python, caption={Softmax con estabilización numérica}]
+class Softmax:
+    @staticmethod
+    def forward(x):
+        x = x - np.max(x)          # evita overflow
+        exp_x = np.exp(x)
+        return exp_x / np.sum(exp_x)
+\end{lstlisting}
+
+\subsection{Propagación Hacia Adelante}
+
+El método recorre cada capa, inserta el nodo de sesgo entre capas ocultas (no en la salida)
+y aplica la función de activación correspondiente al índice de la iteración:
+
+\begin{lstlisting}[style=python, caption={forwardPropagating}]
+def forwardPropagating(self, entradas):
+    activacion = self.agregarBias(entradas.astype(float))
+    activaciones = [activacion]
+    nets = []
+
+    for idx, pesos in enumerate(self.pesos):
+        net = pesos.T @ activacion
+        nets.append(net)
+
+        funcion = ACTIVACIONES[self.activaciones[idx]]
+        activacion = funcion.forward(net)
+
+        if idx < len(self.pesos) - 1:
+            activacion = self.agregarBias(activacion)
+
+        activaciones.append(activacion)
+
+    return activaciones, nets
+\end{lstlisting}
+
+Los vectores \texttt{activaciones} y \texttt{nets} se guardan para el paso de
+retropropagación; \texttt{activaciones[l]} contiene $\tilde{\mathbf{a}}^{[l]}$ (con bias)
+y \texttt{nets[l]} contiene $\mathbf{z}^{[l]}$.
+
+\subsection{Retropropagación con SGD y Adam}
+
+El método calcula primero todos los deltas de atrás hacia adelante y luego aplica la
+actualización con el optimizador seleccionado:
+
+\begin{lstlisting}[style=python, caption={backwardPropagating — cálculo de deltas}]
+# Delta de la capa de salida
+if self.activaciones[-1] == "softmax" and self.perdida == "cross_entropy":
+    deltas[-1] = error_salida   # gradiente combinado simplificado
+else:
+    deltas[-1] = error_salida * ultima_activacion.derivative(nets[-1])
+
+# Capas ocultas (de L-2 hacia 0)
+for l in range(len(self.pesos) - 2, -1, -1):
+    delta_prop = self.pesos[l + 1][1:] @ deltas[l + 1]  # omite fila bias
+    deltas[l] = delta_prop * ACTIVACIONES[self.activaciones[l]].derivative(nets[l])
+\end{lstlisting}
+
+\begin{lstlisting}[style=python, caption={Actualización Adam}]
+beta1, beta2, eps = 0.9, 0.999, 1e-8
+self.adam_t += 1
+for l in range(len(self.pesos)):
+    gradiente = activaciones[l].reshape(-1,1) @ deltas[l].reshape(1,-1)
+    self.m_w[l] = beta1*self.m_w[l] + (1-beta1)*gradiente
+    self.v_w[l] = beta2*self.v_w[l] + (1-beta2)*gradiente**2
+    m_hat = self.m_w[l] / (1 - beta1**self.adam_t)
+    v_hat = self.v_w[l] / (1 - beta2**self.adam_t)
+    self.pesos[l] -= lr * m_hat / (np.sqrt(v_hat) + eps)
+\end{lstlisting}
+
+\subsection{Entrenamiento con Mezcla por Época}
+
+\begin{lstlisting}[style=python, caption={entrenar con shuffle y batch\_log}]
+def entrenar(self, X, y, epocas=10, lr=0.01, batch_log=1):
+    N = len(X)
+    indices = np.arange(N)
+
+    for epoca in range(epocas):
+        np.random.shuffle(indices)      # mezcla el orden cada epoca
+
+        error_total = 0
+        for i in indices:
+            acts, nets = self.forwardPropagating(X[i])
+            error_total += self.backwardPropagating(acts, nets, y[i], lr)
+
+        error_promedio = error_total / N
+        precision = sum(np.argmax(self.predecir(X[i])) == np.argmax(y[i])
+                        for i in range(N)) / N * 100
+
+        self.historial_loss.append(error_promedio)
+        self.historial_precision.append(precision)
+
+        if (epoca + 1) % batch_log == 0:
+            print(f"Epoca {epoca+1:3d} | Error: {error_promedio:.6f} "
+                  f"| Precision: {precision:.2f}%")
+\end{lstlisting}
+
+El parámetro \texttt{batch\_log} controla cada cuántas épocas se imprime el log, evitando
+saturar la salida en ejecuciones largas.
+
+\subsection{Visualización con Matplotlib}
+
+La clase \texttt{VisualizadorRedNeuronal} genera tres tipos de gráficas:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Curvas de aprendizaje} --- pérdida y precisión por época
+    \item \textbf{Predicciones} --- cuadrícula de imágenes con etiqueta predicha vs. real
+    \item \textbf{Errores} --- solo los casos mal clasificados
+    \item \textbf{Matriz de confusión} --- mapa de calor con \texttt{imshow}
+\end{itemize}
+
+% ============================================================
+\section{Implementación en C++}
+% ============================================================
+
+\subsection{Estructura General}
+
+El proyecto C++ se divide en tres archivos:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Archivo} & \textbf{Responsabilidad} \\
+\midrule
+\texttt{mlp.cpp}       & Red neuronal (clase \texttt{MLP}), activaciones, pérdidas, main \\
+\texttt{dataset.cpp}   & Carga de MNIST (IDX binario) e imágenes PNG en carpetas \\
+\texttt{visualizar.cpp}& Generación de reporte HTML interactivo \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La dependencia de \textbf{Eigen} proporciona tipos matriciales nativos (\texttt{MatrixXd},
+\texttt{VectorXd}) con operaciones vectorizadas optimizadas para CPU, equivalentes a los
+arrays de \texttt{numpy}.
+
+\begin{lstlisting}[style=cpp, caption={Enumerados de configuración}]
+enum class Activation { ReLU, LeakyReLU, Sigmoid };
+enum class Init       { He, Xavier };
+enum class Loss       { CrossEntropy, MSE };
+enum class Optimizer  { SGD, Adam };
+\end{lstlisting}
+
+\subsection{Clase MLP}
+
+\subsubsection{Constructor e Inicialización}
+
+El constructor imprime la configuración completa de la red y genera las matrices de pesos
+con la estrategia de inicialización seleccionada:
+
+\begin{lstlisting}[style=cpp, caption={Inicialización de pesos en C++}]
+std::normal_distribution<double> dist(0.0, 1.0);
+for (int i = 0; i < (int)capas.size()-1; i++) {
+    double esc = (init == Init::He)
+        ? std::sqrt(2.0 / capas[i])   // He — ReLU
+        : std::sqrt(1.0 / capas[i]);  // Xavier — Sigmoid/Tanh
+
+    Matrix w(capas[i]+1, capas[i+1]);
+    for (int r = 0; r < w.rows(); r++)
+        for (int c = 0; c < w.cols(); c++)
+            w(r,c) = dist(rng) * esc;
+    pesos.push_back(w);
+
+    m_w.push_back(Matrix::Zero(w.rows(), w.cols()));
+    v_w.push_back(Matrix::Zero(w.rows(), w.cols()));
+}
+\end{lstlisting}
+
+\subsubsection{Propagación Hacia Adelante}
+
+El método retorna un par \texttt{(activaciones, nets)} de forma análoga al Python. La
+función auxiliar estática \texttt{\_bias()} añade el nodo de sesgo:
+
+\begin{lstlisting}[style=cpp, caption={forward en C++}]
+pair<vector<Vector>, vector<Vector>>
+forward(const Vector& entrada) const {
+    vector<Vector> acts, nets;
+    Vector a = _bias(entrada);
+    acts.push_back(a);
+
+    int L = (int)pesos.size();
+    for (int l = 0; l < L; l++) {
+        Vector net = pesos[l].transpose() * a;
+        nets.push_back(net);
+        // capas ocultas: activacion elegida; capa salida: softmax
+        a = (l < L-1) ? _bias(applyAct(net)) : softmax(net);
+        acts.push_back(a);
+    }
+    return {acts, nets};
+}
+\end{lstlisting}
+
+\subsubsection{Retropropagación y Optimizadores}
+
+\begin{lstlisting}[style=cpp, caption={Actualización SGD y Adam en C++}]
+if (optim == Optimizer::SGD) {
+    for (int l = 0; l < L; l++)
+        pesos[l] -= lr * (acts[l] * deltas[l].transpose());
+} else {
+    const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
+    adam_t++;
+    for (int l = 0; l < L; l++) {
+        Matrix grad = acts[l] * deltas[l].transpose();
+        m_w[l] = beta1*m_w[l] + (1.0-beta1)*grad;
+        v_w[l] = beta2*v_w[l] + (1.0-beta2)*grad.array().square().matrix();
+        Matrix m_hat = m_w[l] / (1.0 - std::pow(beta1, adam_t));
+        Matrix v_hat = v_w[l] / (1.0 - std::pow(beta2, adam_t));
+        pesos[l].array() -= lr * m_hat.array() / (v_hat.array().sqrt() + eps);
+    }
+}
+\end{lstlisting}
+
+La notación \texttt{.array()} de Eigen habilita operaciones elemento a elemento, equivalente
+al comportamiento implícito de los arrays de \texttt{numpy}.
+
+\subsection{Visualización HTML (\texttt{visualizar.cpp})}
+
+La clase \texttt{Visualizador} genera un archivo \texttt{.html} autocontenido con cuatro
+secciones interactivas:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Curvas de aprendizaje} --- gráficas interactivas con Chart.js
+    \item \textbf{Predicciones} --- cuadrícula de las primeras $N$ imágenes del test
+    \item \textbf{Errores de clasificación} --- imágenes mal clasificadas con etiqueta real vs.\ predicha
+    \item \textbf{Matriz de confusión} --- tabla HTML con intensidad de color proporcional a la frecuencia
+\end{enumerate}
+
+\subsection{Función \texttt{main} y Arquitectura Recomendada}
+
+El punto de entrada acepta el nombre del dataset por argumento de línea de comandos y
+selecciona automáticamente la arquitectura según la dimensión de entrada:
+
+\begin{lstlisting}[style=cpp, caption={Selección automática de arquitectura}]
+vector<int> arquitectura(const DatasetInfo& ds) {
+    if (ds.inputDim > 1000)
+        return {ds.inputDim, 128, 64, ds.nClases};  // imagenes grandes
+    else
+        return {ds.inputDim,  64, 32, ds.nClases};  // MNIST
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=cpp, caption={Ejemplo de uso completo}]
+// g++ -O2 -std=c++17 -I/usr/include/eigen3 mlp.cpp -o mlp
+// ./mlp mnist
+// ./mlp simpsons
+
+MLP red(arquitectura(ds),
+        Activation::LeakyReLU,
+        Init::He,
+        Loss::CrossEntropy,
+        Optimizer::SGD);
+
+red.entrenar(ds, 70, 0.001);
+reporteCompleto(red, ds);
+
+Visualizador viz(red, ds);
+viz.guardar("reporte_" + dataset + ".html");
+\end{lstlisting}
+
+% ============================================================
+\section{Resultados Esperados}
+% ============================================================
+
+La configuración por defecto de ambas implementaciones es:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parámetro}    & \textbf{Valor} \\
+\midrule
+Arquitectura          & $784 \to 64 \to 32 \to 10$ \\
+Activaciones ocultas  & Leaky ReLU ($\alpha=0.01$) \\
+Activación de salida  & Softmax \\
+Pérdida               & Cross-Entropy \\
+Inicialización        & He \\
+Optimizador           & SGD \\
+Épocas                & 70 \\
+Tasa de aprendizaje   & 0.001 \\
+Muestras entrenamiento & 3\,000 (de 60\,000) \\
+Muestras prueba        & 1\,000 (de 10\,000) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Con esta configuración se espera alcanzar una precisión de clasificación sobre el conjunto
+de prueba de MNIST superior al $90\%$, dependiendo de la inicialización aleatoria. El uso
+del optimizador Adam (\texttt{optimizer="adam"}) con \texttt{lr=0.001} suele converger más
+rápido que SGD puro en las primeras épocas.
+
+% ============================================================
+\section{Conclusiones}
+% ============================================================
+
+\begin{enumerate}
+    \item \textbf{Equivalencia algorítmica:} Ambas implementaciones producen resultados
+    equivalentes al implementar el mismo algoritmo de retropropagación con las mismas
+    estrategias de inicialización, activación y optimización.
+
+    \item \textbf{Diseño sin frameworks:} Construir el MLP desde cero sin TensorFlow ni
+    PyTorch permite comprender a fondo el flujo de datos, la forma exacta de las matrices
+    en cada capa y el origen matemático de cada gradiente.
+
+    \item \textbf{Truco del bias:} Fusionar el sesgo en la primera fila de la matriz de
+    pesos simplifica tanto el código como el cómputo, reduciendo el forward y el backward
+    a multiplicaciones matriciales puras.
+
+    \item \textbf{Leaky ReLU sobre ReLU:} Leaky ReLU evita el fenómeno de neuronas muertas
+    al permitir un gradiente pequeño ($\alpha=0.01$) para entradas negativas, mejorando la
+    estabilidad del entrenamiento especialmente en redes profundas.
+
+    \item \textbf{Adam vs SGD:} Adam converge típicamente más rápido al adaptar la tasa de
+    aprendizaje por parámetro, aunque SGD con buena tasa puede alcanzar resultados similares
+    en más épocas. La implementación soporta ambos sin cambiar la estructura del código.
+
+    \item \textbf{Mezcla por época:} El shuffle aleatorio en cada época rompe correlaciones
+    entre muestras consecutivas, reduciendo el sesgo en el gradiente estocástico y mejorando
+    la generalización del modelo.
+\end{enumerate}
+
+% ============================================================
+\section*{Compilación y Ejecución}
+% ============================================================
+
+\subsection*{Python}
+\begin{lstlisting}[style=python, numbers=none]
+# Dependencias
+pip install numpy tensorflow matplotlib
+
+# Ejecucion
+python MLP.py
+\end{lstlisting}
+
+\subsection*{C++}
+\begin{lstlisting}[style=cpp, numbers=none]
+# Dependencias
+sudo apt install libeigen3-dev
+wget https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
+
+# Compilacion
+g++ -O2 -std=c++17 -I/usr/include/eigen3 mlp.cpp -o mlp
+
+# Ejecucion
+./mlp mnist
+./mlp simpsons
+\end{lstlisting}

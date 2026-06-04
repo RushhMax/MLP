@@ -1,0 +1,65 @@
+# Compilados C/C++
+*.o
+*.out
+*.a
+*.so
+*.exe
+
+# Ejecutables generados
+mlp
+out
+
+# Directorios de compilación
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Entornos virtuales
+venv/
+.env/
+.venv/
+
+# Archivos temporales
+*.tmp
+*.log
+*.swp
+*.swo
+*~
+
+# Reportes generados
+reporte_*.html
+
+# Archivos de LaTeX generados
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+
+# Configuración de VS Code
+.vscode/
+
+# Configuración de CLion/JetBrains
+.idea/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
