@@ -1,8 +1,8 @@
-
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
+#include <map>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -11,17 +11,15 @@
 #include <iomanip>
 #include <filesystem>
 #include <memory>
-#include <Eigen/Dense>
+#include "linalg.h"
 
+// numeros aleatorio semillas 42
 static std::mt19937 rng(42);
 
 struct Split;
 void shuffleSplit(Split& s);
 
 namespace fs = std::filesystem;
-
-using Matrix = Eigen::MatrixXd;
-using Vector = Eigen::VectorXd;
 
 using namespace std;
 
@@ -143,7 +141,7 @@ class ImageFolderLoader : public DatasetLoader {
         string testPath;
         vector<string> clases;
         int imgSize;
-        int maxPorClase;
+        int maxPorClase; // 0 = sin límite, 100 = máximo 100 imágenes por clase, etc.
         bool color; // false = grises (1 canal), true = RGB (3 canales)
 
         ImageFolderLoader( const string& trainPath_, const string& testPath_, const vector<string>& clases_,
@@ -237,6 +235,140 @@ class ImageFolderLoader : public DatasetLoader {
             }
             return s;
         }
+};
+
+
+// ==========================================================
+// LOADER: HASYv2 (símbolos matemáticos 32×32 gris, fold-based)
+// ==========================================================
+
+class HASYLoader : public DatasetLoader {
+public:
+    string dataPath;
+    int fold;
+    int maxTrain;
+    int maxTest;
+
+    HASYLoader(
+        const string& dataPath_ = "data/hasy",
+        int fold_     = 1,
+        int maxTrain_ = 0,
+        int maxTest_  = 0
+    ) : dataPath(dataPath_), fold(fold_),
+        maxTrain(maxTrain_), maxTest(maxTest_) {}
+
+    DatasetInfo cargar() override {
+        DatasetInfo info;
+        info.nombre   = "HASYv2";
+        info.inputDim = 32 * 32;
+
+        // 1. Leer symbols.csv: symbol_id,latex,training_samples,test_samples
+        map<int,string> idToLatex;
+        map<int,int>    idToClass;
+        {
+            string path = dataPath + "/symbols.csv";
+            ifstream f(path);
+            if (!f) throw runtime_error("No se pudo abrir: " + path);
+            string line;
+            getline(f, line); // header
+            int ci = 0;
+            while (getline(f, line)) {
+                if (line.empty()) continue;
+                auto c1 = line.find(',');
+                auto c2 = line.find(',', c1 + 1);
+                int sid       = stoi(line.substr(0, c1));
+                string latex  = line.substr(c1 + 1, c2 - c1 - 1);
+                idToLatex[sid] = latex;
+                idToClass[sid] = ci++;
+            }
+        }
+        info.nClases = (int)idToLatex.size();
+        info.etiquetas.resize(info.nClases);
+        for (auto& [sid, ci] : idToClass)
+            info.etiquetas[ci] = idToLatex[sid];
+
+        // 2. Cargar el fold solicitado
+        string foldDir = dataPath + "/classification-task/fold-" + to_string(fold);
+        cout << "\nCargando HASYv2 fold-" << fold << " desde: " << foldDir << "\n";
+        cout << "  Clases: " << info.nClases << "  |  InputDim: " << info.inputDim << "\n";
+
+        info.train = leerSplit(foldDir + "/train.csv", foldDir, idToClass, maxTrain, "train");
+        shuffleSplit(info.train);
+        info.test  = leerSplit(foldDir + "/test.csv",  foldDir, idToClass, maxTest,  "test");
+        return info;
+    }
+
+private:
+    Vector cargarImagen(const string& path) {
+        int w, h, ch;
+        unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, STBI_grey);
+        if (!data) throw runtime_error("No se pudo cargar: " + path);
+        Vector img(32 * 32);
+        for (int i = 0; i < 32 * 32; i++)
+            img(i) = data[i] / 255.0;
+        stbi_image_free(data);
+        return img;
+    }
+
+    Split leerSplit(const string& csvPath, const string& foldDir,
+                    const map<int,int>& idToClass, int maxN,
+                    const string& splitName) {
+        ifstream f(csvPath);
+        if (!f) throw runtime_error("No se pudo abrir: " + csvPath);
+
+        // Paso 1: indexar todas las filas por clase (sin cargar imágenes aún)
+        map<int, vector<string>> byClass; // classIdx → rutas relativas
+        string line;
+        getline(f, line); // header: path,symbol_id,latex,user_id
+        while (getline(f, line)) {
+            if (line.empty()) continue;
+            auto c1 = line.find(',');
+            auto c2 = line.find(',', c1 + 1);
+            string relPath = line.substr(0, c1);
+            int sid = stoi(line.substr(c1 + 1, c2 - c1 - 1));
+            auto it = idToClass.find(sid);
+            if (it == idToClass.end()) continue;
+            byClass[it->second].push_back(move(relPath));
+        }
+
+        // Paso 2: seleccionar muestras distribuidas por clase
+        int nActive = (int)byClass.size();
+        int perClass = (maxN <= 0) ? INT_MAX : max(1, maxN / nActive);
+
+        vector<pair<int,string>> selected; // (classIdx, relPath)
+        for (auto& [ci, paths] : byClass) {
+            vector<int> idx(paths.size());
+            iota(idx.begin(), idx.end(), 0);
+            shuffle(idx.begin(), idx.end(), rng);
+            int take = min((int)paths.size(), perClass);
+            for (int k = 0; k < take; k++)
+                selected.emplace_back(ci, paths[idx[k]]);
+        }
+        shuffle(selected.begin(), selected.end(), rng);
+
+        // Paso 3: cargar imágenes de la selección
+        Split s;
+        s.X.reserve(selected.size());
+        s.y.reserve(selected.size());
+        s.nombres.reserve(selected.size());
+        int count = 0, errores = 0;
+
+        for (auto& [ci, relPath] : selected) {
+            fs::path imgPath = (fs::path(foldDir) / relPath).lexically_normal();
+            try {
+                s.X.push_back(cargarImagen(imgPath.string()));
+                s.y.push_back(ci);
+                s.nombres.push_back(imgPath.filename().string());
+                count++;
+                if (count % 5000 == 0)
+                    cout << "  [" << splitName << "] " << count << " imágenes cargadas...\n";
+            } catch (...) { errores++; }
+        }
+        cout << "  [" << splitName << "] total: " << count << " imágenes"
+             << " (" << nActive << " clases, ~" << perClass << "/clase)\n";
+        if (errores) cout << "  (" << errores << " errores)\n";
+        return s;
+    }
 };
 
 

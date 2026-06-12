@@ -6,7 +6,6 @@
  *   - Simpsons MNIST (PNG en carpeta data/)
  *
  * Dependencias:
- *   - sudo apt install libeigen3-dev
  *   - wget https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
  *
  * Compilación:
@@ -28,13 +27,10 @@
 #include <iomanip>
 #include <filesystem>
 #include <memory>
-#include <Eigen/Dense>
+#include "linalg.h"
 #include "dataset.cpp"
 
 using namespace std;
-
-using Matrix = Eigen::MatrixXd;
-using Vector = Eigen::VectorXd;
 
 // ----------------------------------------------------------
 // Utilidades comunes
@@ -60,29 +56,29 @@ int argmax(const Vector& v) {
 
 // relu max(x,0)
 Vector relu(const Vector& x) { return x.cwiseMax(0.0); }
-Vector relu_d(const Vector& x) { return (x.array() > 0.0).cast<double>(); }
+Vector relu_d(const Vector& x) { return x.gt(0.0); }
 
 // leaky relu max(0.01x, x)
 Vector leaky_relu(const Vector& x, double alpha = 0.01) {
     return x.cwiseMax(alpha * x);
 }
 Vector leaky_relu_d(const Vector& x, double alpha = 0.01) {
-    return (x.array() > 0.0).cast<double>() * (1.0 - alpha) + alpha;
+    return x.gt(0.0) * (1.0 - alpha) + alpha;
 }
 
 // sigmoid 1/(1+e^-x)  — útil para salidas binarias
 Vector sigmoid(const Vector& x) {
-    return 1.0 / (1.0 + (-x.array()).exp());
+    return 1.0 / (1.0 + (-x).exp());
 }
 Vector sigmoid_d(const Vector& x) {
     Vector s = sigmoid(x);
-    return s.array() * (1.0 - s.array());
+    return s * (1.0 - s);
 }
 
 // para clasificación multiclase (salida)
 Vector softmax(const Vector& x) {
-    Vector xs = x.array() - x.maxCoeff();
-    Vector e  = xs.array().exp();
+    Vector xs = x - x.max();
+    Vector e  = xs.exp();
     return e / e.sum();
 }
 
@@ -93,12 +89,12 @@ Vector softmax(const Vector& x) {
 // Cross-Entropy (multiclase)
 double ceLoss(const Vector& yt, const Vector& yp) {
     const double eps = 1e-15;
-    Vector yc = yp.array().cwiseMax(eps).cwiseMin(1.0-eps);
-    return -(yt.array() * yc.array().log()).sum();
+    Vector yc = yp.clamp(eps, 1.0 - eps);
+    return -(yt * yc.log()).sum();
 }
 Vector ceDeriv(const Vector& yt, const Vector& yp) {
     const double eps = 1e-15;
-    Vector yc = yp.array().cwiseMax(eps).cwiseMin(1.0-eps);
+    Vector yc = yp.clamp(eps, 1.0 - eps);
     return yc - yt;
 }
 
@@ -107,7 +103,7 @@ double mseLoss(const Vector& yt, const Vector& yp) {
     return 0.5 * (yp - yt).squaredNorm() / yt.size();
 }
 Vector mseDeriv(const Vector& yt, const Vector& yp) {
-    return (yp - yt) / yt.size();
+    return (yp - yt) / (double)yt.size();
 }
 
 // ==========================================================
@@ -179,7 +175,7 @@ class MLP {
 
             int L = (int)pesos.size();
             for (int l = 0; l < L; l++) {
-                Vector net = pesos[l].transpose() * a;
+                Vector net = pesos[l].transposeMul(a);
                 nets.push_back(net);
                 a = (l < L-1) ? _bias(applyAct(net)) : softmax(net);
                 acts.push_back(a);
@@ -203,24 +199,24 @@ class MLP {
             // Capas ocultas
             for (int l = L-2; l >= 0; l--) {
                 Matrix wNoBias = pesos[l+1].bottomRows(pesos[l+1].rows()-1);
-                deltas[l] = (wNoBias * deltas[l+1]).array() * applyActDeriv(nets[l]).array();
+                deltas[l] = (wNoBias * deltas[l+1]) * applyActDeriv(nets[l]);
             }
 
             // Actualizar pesos según optimizador
             if (optim == Optimizer::SGD) {
                 for (int l = 0; l < L; l++)
-                    pesos[l] -= lr * (acts[l] * deltas[l].transpose());
+                    pesos[l] -= lr * Mat::outer(acts[l], deltas[l]);
             } else {
                 // Adam
                 const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
                 adam_t++;
                 for (int l = 0; l < L; l++) {
-                    Matrix grad = acts[l] * deltas[l].transpose();
+                    Matrix grad = Mat::outer(acts[l], deltas[l]);
                     m_w[l] = beta1 * m_w[l] + (1.0-beta1) * grad;
-                    v_w[l] = beta2 * v_w[l] + (1.0-beta2) * grad.array().square().matrix();
+                    v_w[l] = beta2 * v_w[l] + (1.0-beta2) * grad.square();
                     Matrix m_hat = m_w[l] / (1.0 - std::pow(beta1, adam_t));
                     Matrix v_hat = v_w[l] / (1.0 - std::pow(beta2, adam_t));
-                    pesos[l].array() -= lr * m_hat.array() / (v_hat.array().sqrt() + eps);
+                    pesos[l] -= lr * m_hat.cwiseDiv(v_hat.sqrt() + eps);
                 }
             }
 
@@ -327,7 +323,7 @@ class MLP {
         static Vector _bias(const Vector& x) {
             Vector r(x.size()+1);
             r(0) = 1.0;
-            r.tail(x.size()) = x;
+            for (int i = 0; i < x.size(); i++) r(i+1) = x(i);
             return r;
         }
 };
@@ -451,13 +447,25 @@ std::unique_ptr<DatasetLoader> crearLoader(const std::string& nombre) {
         );
     }
 
+    if (nombre == "hasy") {
+        return std::make_unique<HASYLoader>(
+            "data/hasy",
+            /*fold=*/     1,
+            /*maxTrain=*/ 5000,
+            /*maxTest=*/  1000
+        );
+    }
+
     throw std::invalid_argument("Dataset desconocido: " + nombre +
-        "\nDatasets disponibles: mnist, simpsons");
+        "\nDatasets disponibles: mnist, simpsons, hasy");
 }
 
 // Arquitectura recomendada por dataset
 vector<int> arquitectura(const DatasetInfo& ds) {
-    if (ds.inputDim > 1000)
+    if (ds.nClases > 100)
+        // HASYv2 y datasets con muchas clases necesitan más capacidad
+        return {ds.inputDim, 256, 128, ds.nClases};
+    else if (ds.inputDim > 1000)
         return {ds.inputDim, 128, 64, ds.nClases};
     else
         return {ds.inputDim, 64, 32, ds.nClases};
