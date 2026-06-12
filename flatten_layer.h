@@ -4,7 +4,6 @@
 
 // -------------------------------------------------------
 // FlattenLayer
-//
 //   Convierte Tensor3D [C][H][W]  →  vector<double> [C*H*W]
 //   Orden: canal externo, fila media, columna interna
 //   (C-contiguous / row-major)

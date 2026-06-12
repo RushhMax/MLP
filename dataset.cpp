@@ -29,18 +29,18 @@ using namespace std;
 // ==========================================================
 
 struct Split {
-    vector<Vector> X;
-    vector<int> y;
+    vector<Vector> X; // imagenes como vectores de numeros
+    vector<int> y; //la etiqueta de cada img
     vector<string> nombres;  // nombre de archivo o índice (debug)
 };
 
 struct DatasetInfo {
-    string nombre;
-    int inputDim;
-    int nClases;
+    string nombre; 
+    int inputDim; // tamanio de cada img
+    int nClases; // cuantas clases hay 
     vector<string> etiquetas; // nombre de cada clase
-    Split train;
-    Split test;
+    Split train; // img de train
+    Split test; // img de test
 };
 
 class DatasetLoader {

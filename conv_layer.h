@@ -3,9 +3,7 @@
 #include <string>
 #include <stdexcept>
 
-// -------------------------------------------------------
-// Tipos de tensores (solo STL)
-// -------------------------------------------------------
+// Tipos de tensores 
 
 // Tensor 3D: [canales][filas][columnas]
 using Tensor3D = std::vector<std::vector<std::vector<double>>>;
@@ -20,17 +18,14 @@ using Tensor4D = std::vector<std::vector<std::vector<std::vector<double>>>>;
 enum class Padding  { VALID, SAME };
 enum class PoolType { MAX, MIN, AVERAGE };
 
-// -------------------------------------------------------
-// ConvLayer
-//
+// Red Convolucional
 //   Input:  Tensor3D [C_in][H][W]
 //   Output: Tensor3D [F][H'][W']
-//
+
 //   VALID: H' = floor((H - K) / stride) + 1
 //   SAME:  H' = ceil(H / stride)   (pad simétricamente)
-//
+
 //   Activación fija: ReLU
-// -------------------------------------------------------
 
 class ConvLayer {
 public:
