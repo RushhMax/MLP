@@ -1,0 +1,965 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-nodecimaldot]{babel}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{array}
+
+\geometry{top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}
+
+% ── Colores ──────────────────────────────────────────────────
+\definecolor{codeblue}{RGB}{0,70,180}
+\definecolor{codegray}{RGB}{120,120,120}
+\definecolor{codegreen}{RGB}{0,120,0}
+\definecolor{codepurple}{RGB}{130,0,130}
+\definecolor{backcolor}{RGB}{248,248,250}
+\definecolor{bordercolor}{RGB}{200,200,210}
+
+% ── Estilo listados CUDA/C++ ──────────────────────────────────
+\lstdefinestyle{cuda}{
+  language=C++,
+  backgroundcolor=\color{backcolor},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codeblue}\bfseries,
+  commentstyle=\color{codegreen}\itshape,
+  stringstyle=\color{codepurple},
+  numbers=left,
+  numberstyle=\tiny\color{codegray},
+  stepnumber=1,
+  numbersep=8pt,
+  frame=single,
+  rulecolor=\color{bordercolor},
+  breaklines=true,
+  breakatwhitespace=false,
+  tabsize=4,
+  showstringspaces=false,
+  morekeywords={__global__,__device__,__shared__,__host__,
+                threadIdx,blockIdx,blockDim,gridDim,
+                cudaMalloc,cudaFree,cudaMemcpy,cudaMemset,
+                cudaMemcpyHostToDevice,cudaMemcpyDeviceToHost,
+                cudaDeviceProp,cudaGetDeviceProperties,
+                cublasHandle_t,cublasCreate,cublasDestroy,
+                cublasSgemv,CUBLAS_OP_N,
+                uint8_t,uint32_t,
+                vector,string,unique_ptr,make_unique,
+                syncthreads,fmaxf,sqrtf,expf,logf},
+  escapeinside={(*@}{@*)},
+  captionpos=b,
+}
+\lstset{style=cuda}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=codeblue,
+  urlcolor=codeblue,
+  citecolor=codegreen,
+}
+
+% ── Macros matemáticas ────────────────────────────────────────
+\newcommand{\R}{\mathbb{R}}
+\DeclareMathOperator*{\argmax}{argmax}
+\newcommand{\todo}[1]{\textit{\textcolor{codegray}{[Pendiente: #1]}}}
+
+% ─────────────────────────────────────────────────────────────
+\title{%
+  \textbf{Clasificación de Imágenes con CNN + MLP Acelerado en CUDA}\\[0.5em]
+  \large Implementación desde cero de un pipeline\\
+  Red Neuronal Convolucional (CPU) + Perceptrón Multicapa CUDA (GPU)
+}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introducción}
+% ============================================================
+
+La clasificación de imágenes es una de las tareas centrales del aprendizaje automático moderno.
+Aplicar un Perceptrón Multicapa (MLP) directamente sobre los píxeles crudos presenta tres
+limitaciones estructurales fundamentales:
+
+\begin{itemize}[noitemsep]
+  \item \textbf{Ignora la estructura espacial:} los píxeles adyacentes son igualmente
+    importantes para el modelo que píxeles ubicados en extremos opuestos de la imagen.
+  \item \textbf{No tiene invarianza traslacional:} un dígito ``3'' desplazado dos píxeles
+    a la derecha produce una representación completamente distinta en el vector de entrada.
+  \item \textbf{Escala cuadrática de parámetros:} una imagen de $32\times32$ ya genera
+    1\,024 entradas; con una primera capa de 512 neuronas el modelo tiene más de 500\,000
+    parámetros solo en la primera capa.
+\end{itemize}
+
+Las Redes Neuronales Convolucionales (CNN) resuelven estas limitaciones explotando tres
+principios:
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Localidad:} cada neurona procesa únicamente una región local
+    (\textit{campo receptivo}) en lugar de toda la imagen.
+  \item \textbf{Compartición de parámetros:} el mismo filtro se aplica en todas las
+    posiciones espaciales, reduciendo drásticamente el número de pesos entrenables.
+  \item \textbf{Equivarianza traslacional:} si la entrada se desplaza, las activaciones
+    internas se desplazan del mismo modo, facilitando la detección de características
+    en cualquier posición de la imagen.
+\end{enumerate}
+
+Este informe documenta la implementación completa de un pipeline
+\textbf{CNN (CPU) + MLP CUDA (GPU)} desarrollado en C++17/CUDA sin frameworks de alto nivel.
+La retropropagación fluye de forma continua desde la capa de salida del MLP hasta los kernels
+de la primera capa convolucional, actualizando todos los parámetros del modelo de forma
+coordinada.
+
+La división CPU/GPU responde a un compromiso de diseño deliberado:
+\begin{itemize}[noitemsep]
+  \item Las capas convolucionales corren en \textbf{CPU en precisión \texttt{double} (64 bits)}
+    para garantizar estabilidad numérica en los gradientes de los kernels, que son pequeños
+    y sensibles al redondeo.
+  \item El MLP corre en \textbf{GPU en precisión \texttt{float} (32 bits)} y se beneficia
+    de la tasa de cómputo masivamente paralela de CUDA y la biblioteca cuBLAS para
+    operaciones matriciales.
+\end{itemize}
+
+% ============================================================
+\section{Fundamentos Teóricos}
+% ============================================================
+
+\subsection{La Operación de Convolución 2D}
+
+Dado un tensor de entrada $\mathbf{X} \in \R^{C \times H \times W}$ (canales, alto, ancho)
+y un banco de $F$ filtros $\mathbf{K} \in \R^{F \times C \times K_h \times K_w}$, la
+pre-activación del mapa de características del filtro $f$ en la posición $(h', w')$
+con paso \textit{stride} $s$ es:
+
+\begin{equation}
+  \mathbf{Z}[f,\, h',\, w'] \;=\; b_f \;+\;
+  \sum_{c=0}^{C-1} \sum_{i=0}^{K_h-1} \sum_{j=0}^{K_w-1}
+  \mathbf{X}_{\mathrm{pad}}[c,\; h'\!\cdot s + i,\; w'\!\cdot s + j]
+  \cdot \mathbf{K}[f,\, c,\, i,\, j]
+  \label{eq:conv}
+\end{equation}
+
+donde $b_f$ es el sesgo del filtro $f$ y $\mathbf{X}_{\mathrm{pad}}$ es el input con
+relleno de ceros (\textit{zero-padding}). En la práctica del deep learning la operación
+\eqref{eq:conv} es técnicamente una \textbf{correlación cruzada} (el kernel no se voltea
+espacialmente), convención estándar adoptada en la implementación.
+
+\subsubsection{Modos de Relleno: VALID y SAME}
+
+El modo de relleno determina la relación entre las dimensiones del input y del output:
+
+\begin{itemize}
+  \item \textbf{VALID} (sin relleno): el kernel solo se aplica donde cabe completamente
+    dentro del input.
+    \[H' = \left\lfloor \frac{H - K_h}{s} \right\rfloor + 1\]
+
+  \item \textbf{SAME}: se añaden ceros simétricamente para que la salida tenga
+    $H' = \lceil H / s \rceil$, conservando las dimensiones espaciales cuando $s=1$.
+    El relleno total necesario en el eje vertical es:
+    \begin{equation}
+      p_H = \max\!\left(0,\;
+        \left\lceil \frac{H}{s} \right\rceil \cdot s - H + K_h - s
+      \right)
+      \label{eq:same_pad}
+    \end{equation}
+    Se distribuye $\lfloor p_H/2 \rfloor$ arriba y $\lceil p_H/2 \rceil$ abajo
+    (análogo para el eje horizontal).
+\end{itemize}
+
+La implementación utiliza SAME con $s=1$ en ambas capas convolucionales, por lo que los
+mapas de características conservan exactamente las dimensiones espaciales del input a
+cada capa convolucional.
+
+\subsubsection{Activación ReLU y Caché para Backprop}
+
+Tras la suma ponderada se aplica ReLU elemento a elemento:
+\begin{equation}
+  \mathbf{A}[f, h', w'] = \max\!\left(0,\; \mathbf{Z}[f, h', w']\right)
+\end{equation}
+
+La capa guarda en caché el input original, el input con padding y la pre-activación
+$\mathbf{Z}$ antes de ReLU, ya que los tres son necesarios durante la retropropagación.
+
+\subsubsection{Inicialización He de los Kernels}
+
+Los pesos del kernel se inicializan con la estrategia de He (Kaiming):
+\begin{equation}
+  w \sim \mathcal{N}\!\left(0,\;\; \frac{2}{C \cdot K_h \cdot K_w}\right)
+\end{equation}
+El factor 2 en el numerador compensa que ReLU anula en promedio la mitad de las
+activaciones, manteniendo la varianza de la señal estable a través de las capas.
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Capa de Pooling}
+
+El pooling reduce las dimensiones espaciales del mapa de características mediante una
+operación no lineal sobre ventanas locales, proporcionando invarianza a pequeñas
+traslaciones y reduciendo el coste computacional de las capas siguientes.
+
+Dada una ventana de $P \times P$ con paso $s_P$, las dimensiones de salida son:
+\begin{equation}
+  H'_{\mathrm{pool}} = \left\lfloor \frac{H - P}{s_P} \right\rfloor + 1
+\end{equation}
+
+\subsubsection{MAX Pooling}
+
+Selecciona el valor máximo dentro de cada ventana:
+\begin{equation}
+  \mathbf{M}[c, h', w'] = \max_{\substack{0 \le i < P \\ 0 \le j < P}}
+  \mathbf{A}[c,\; h' \cdot s_P + i,\; w' \cdot s_P + j]
+\end{equation}
+
+La implementación almacena en una \textbf{máscara de posiciones ganadoras} el índice
+lineal $\texttt{mask\_}[c][h'][w'] = i \cdot P + j$ del elemento que produjo el máximo.
+Esta máscara es la única información necesaria para el backward.
+
+\subsubsection{AVERAGE Pooling}
+
+Calcula el promedio de la ventana, distribuyendo el gradiente uniformemente durante
+la retropropagación:
+\begin{equation}
+  \mathbf{M}[c, h', w'] = \frac{1}{P^2}
+  \sum_{i=0}^{P-1} \sum_{j=0}^{P-1} \mathbf{A}[c,\; h' \cdot s_P + i,\; w' \cdot s_P + j]
+\end{equation}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Capa de Aplanado (Flatten)}
+
+La capa de aplanado convierte el tensor tridimensional de salida del pooling
+$\mathbf{M} \in \R^{C \times H' \times W'}$ en un vector unidimensional:
+\begin{equation}
+  \mathbf{x}_{\mathrm{flat}}[\,c \cdot H' \cdot W' + h' \cdot W' + w'\,]
+  = \mathbf{M}[c,\, h',\, w']
+\end{equation}
+
+Es una operación puramente topológica, sin parámetros entrenables. El vector resultante
+$\mathbf{x}_{\mathrm{flat}} \in \R^{C \cdot H' \cdot W'}$ constituye la entrada al MLP
+y cierra el puente entre la \textbf{extracción de características} (parte CNN) y la
+\textbf{clasificación} (parte MLP).
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Retropropagación en la CNN}
+
+La retropropagación aplica la regla de la cadena a través de cada capa en orden inverso.
+El gradiente $\partial \mathcal{L}/\partial \mathbf{x}_{\mathrm{flat}}$ llega desde el
+MLP en la GPU y debe propagarse hacia atrás por Flatten, Pooling y Convolución.
+
+\subsubsection{Gradiente a través de Flatten}
+
+El backward de flatten remodela el vector gradiente de vuelta a la forma del tensor:
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{M}[c, h', w']}
+  = \frac{\partial \mathcal{L}}{\partial
+    \mathbf{x}_{\mathrm{flat}}[c \cdot H' \cdot W' + h' \cdot W' + w']}
+\end{equation}
+
+\subsubsection{Gradiente a través del MAX Pooling}
+
+El gradiente fluye únicamente hacia la posición ganadora registrada en la máscara;
+todas las demás posiciones de la ventana reciben gradiente cero:
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{A}[c, h, w]}
+  = \begin{cases}
+    \dfrac{\partial \mathcal{L}}{\partial \mathbf{M}[c, h', w']}
+      & \text{si } (h, w) \text{ fue el máximo de la ventana } (h',w') \\[8pt]
+    0 & \text{en caso contrario}
+  \end{cases}
+\end{equation}
+
+\subsubsection{Gradiente a través de la Convolución}
+
+Sea $\boldsymbol{\delta} = \frac{\partial \mathcal{L}}{\partial \mathbf{A}}
+\odot \mathbf{1}[\mathbf{Z} > 0]$ el delta tras deshacer la ReLU.
+Los gradientes respecto a los kernels y al input son:
+
+\begin{align}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{K}[f,c,i,j]}
+  &= \sum_{h'}\sum_{w'} \boldsymbol{\delta}[f, h', w'] \cdot
+     \mathbf{X}_{\mathrm{pad}}[c,\; h' \cdot s + i,\; w' \cdot s + j]
+  \label{eq:grad_kernel} \\[6pt]
+  \frac{\partial \mathcal{L}}{\partial \mathbf{X}[c, h, w]}
+  &= \sum_{f}\sum_{i}\sum_{j} \boldsymbol{\delta}[f, h', w'] \cdot \mathbf{K}[f, c, i, j]
+  \label{eq:grad_input_conv}
+\end{align}
+
+donde en \eqref{eq:grad_input_conv} la suma recorre todas las ventanas $(h', w')$ cuyo
+campo receptivo cubre la posición $(h, w)$. Esta operación es equivalente a una convolución
+\textit{full} de $\boldsymbol{\delta}$ con el kernel volteado $180°$.
+
+\subsubsection{Flujo End-to-End del Gradiente}
+
+El pipeline completo de retropropagación sigue el orden inverso al forward:
+\begin{equation}
+  \underbrace{\frac{\partial \mathcal{L}}{\partial \mathbf{x}_{\mathrm{flat}}}}_{\text{GPU}}
+  \;\xrightarrow{\;\mathrm{Flatten}^{-1}\;}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{M}}
+  \;\xrightarrow{\;\mathrm{Pool}_2^{-1}\;}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{A}_2}
+  \;\xrightarrow{\;\mathrm{Conv}_2^{-1}\;}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{A}_1}
+  \;\xrightarrow{\;\mathrm{Pool}_1^{-1}\;}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{Z}_1}
+  \;\xrightarrow{\;\mathrm{Conv}_1^{-1}\;}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{X}}
+  \label{eq:gradient_flow}
+\end{equation}
+
+% ──────────────────────────────────────────────────────────────
+\subsection{Programación Paralela en GPU con CUDA}
+
+\subsubsection{Modelo de Ejecución SIMT}
+
+CUDA organiza la ejecución bajo el modelo \textit{Single Instruction, Multiple Threads}
+(SIMT) en una jerarquía de tres niveles:
+
+\begin{itemize}
+  \item \textbf{Thread:} unidad mínima de ejecución. Cada thread ejecuta el mismo código
+    del kernel pero opera sobre datos distintos.
+  \item \textbf{Block:} grupo de threads que comparten \textit{shared memory} y pueden
+    sincronizarse con la barrera \texttt{\_\_syncthreads()}.
+  \item \textbf{Grid:} colección de bloques que ejecuta el mismo kernel. Los bloques
+    son independientes entre sí y el scheduler de la GPU los distribuye libremente
+    entre los multiprocesadores (SM).
+\end{itemize}
+
+El índice global de un thread en un grid unidimensional se calcula como:
+\begin{equation}
+  \texttt{idx} = \texttt{blockIdx.x} \times \texttt{blockDim.x} + \texttt{threadIdx.x}
+  \label{eq:cuda_idx}
+\end{equation}
+
+Los kernels que operan sobre matrices 2D utilizan grids bidimensionales con índices
+\texttt{r} (fila) y \texttt{c} (columna) para que cada thread actualice un único
+elemento de la matriz.
+
+\subsubsection{Jerarquía de Memoria GPU}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Tipo}      & \textbf{Alcance}   & \textbf{Latencia aprox.} & \textbf{Capacidad aprox.} \\
+\midrule
+Registros          & Por thread         & 1 ciclo                  & $\sim$64 KB/SM \\
+Shared memory      & Por bloque         & $\sim$5 ciclos           & 48--96 KB/bloque \\
+Caché L1/L2        & Por SM / chip      & $\sim$30 ciclos          & Automático \\
+Memoria global     & Todo el device     & $\sim$800 ciclos         & Varios GB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La \textbf{shared memory} es clave para operaciones de reducción paralela como el
+cálculo del softmax, donde múltiples threads deben cooperar para encontrar el máximo
+y la suma del mismo vector.
+
+\subsubsection{cuBLAS: Multiplicación Matriz-Vector}
+
+La operación central del forward del MLP en cada capa $l$ es:
+\begin{equation}
+  \mathbf{z}^{[l]} = \bigl(W^{[l]}\bigr)^T \tilde{\mathbf{a}}^{[l-1]}
+  \label{eq:matvec}
+\end{equation}
+
+Esta operación se delega a \texttt{cublasSgemv}, la rutina cuBLAS para producto
+matriz-vector en simple precisión. Como cuBLAS asume almacenamiento en columna
+(\textit{column-major}) y los pesos se almacenan en fila (\textit{row-major}), el
+flag \texttt{CUBLAS\_OP\_N} sobre la vista transpuesta produce el resultado correcto.
+
+% ============================================================
+\section{Arquitectura del Pipeline}
+% ============================================================
+
+\subsection{Visión General}
+
+La red completa divide el cómputo entre CPU y GPU:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Componente}   & \textbf{Dispositivo} & \textbf{Precisión}      & \textbf{Parámetros (MNIST)} \\
+\midrule
+Conv1 (1→32, 3×3)     & CPU                  & \texttt{double} 64-bit  & $1\times32\times3\times3 + 32 = 320$ \\
+Pool1 (MAX 2×2)       & CPU                  & \texttt{double} 64-bit  & 0 \\
+Conv2 (32→64, 3×3)    & CPU                  & \texttt{double} 64-bit  & $32\times64\times3\times3 + 64 = 18\,496$ \\
+Pool2 (MAX 2×2)       & CPU                  & \texttt{double} 64-bit  & 0 \\
+Flatten               & CPU                  & \texttt{double} 64-bit  & 0 \\
+MLP (3136→256→128→10) & GPU                  & \texttt{float}  32-bit  & $\sim$836\,K \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Flujo Forward para MNIST ($28\times28$, 1 canal)}
+
+\begin{equation*}
+[1][28][28]
+\xrightarrow{\substack{\text{Conv}(1\to32)\\3\times3,\;\text{SAME}}}
+[32][28][28]
+\xrightarrow{\text{Pool}(2\times2)}
+[32][14][14]
+\xrightarrow{\substack{\text{Conv}(32\to64)\\3\times3,\;\text{SAME}}}
+[64][14][14]
+\xrightarrow{\text{Pool}(2\times2)}
+[64][7][7]
+\xrightarrow{\text{Flatten}}
+\mathbf{x}\in\R^{3136}
+\xrightarrow{\text{MLP}}
+\hat{y}\in\R^{10}
+\end{equation*}
+
+\subsection{Flujo Forward para HASYv2 ($32\times32$, 1 canal)}
+
+\begin{equation*}
+[1][32][32]
+\xrightarrow{\text{Conv}(1\to32)}
+[32][32][32]
+\xrightarrow{\text{Pool}}
+[32][16][16]
+\xrightarrow{\text{Conv}(32\to64)}
+[64][16][16]
+\xrightarrow{\text{Pool}}
+[64][8][8]
+\xrightarrow{\text{Flatten}}
+\mathbf{x}\in\R^{4096}
+\xrightarrow{\text{MLP}}
+\hat{y}\in\R^{369}
+\end{equation*}
+
+\subsection{Interfaz CPU--GPU: Conversión de Precisión}
+
+En la frontera entre CNN y MLP existe una conversión de precisión explícita:
+
+\begin{itemize}
+  \item \textbf{Forward (CPU→GPU):} el vector \texttt{double} de Flatten se convierte a
+    \texttt{float} y se transfiere a memoria GPU con \texttt{cudaMemcpy
+    (HostToDevice)}.
+  \item \textbf{Backward (GPU→CPU):} el vector gradiente \texttt{float} devuelto por el
+    MLP se convierte a \texttt{double} antes de pasarse a \texttt{flatten.backward()}.
+\end{itemize}
+
+Esta elección preserva la precisión aritmética en los gradientes de los kernels
+convolucionales (pequeños, sensibles al redondeo) sin sacrificar la velocidad en las
+operaciones matriciales del MLP, donde \texttt{float} ofrece mayor throughput en GPU.
+
+% ============================================================
+\section{Implementación}
+% ============================================================
+
+\subsection{Estructura de Archivos}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Archivo}                & \textbf{Responsabilidad} \\
+\midrule
+\texttt{conv\_layer.h/.cpp}     & Capa convolucional: forward y backward en CPU \\
+\texttt{pooling\_layer.h/.cpp}  & Capa de pooling: forward y backward en CPU \\
+\texttt{flatten\_layer.h/.cpp}  & Aplanado: forward y backward en CPU \\
+\texttt{mlp\_cuda.h}            & MLP con kernels CUDA, cuBLAS, Adam/SGD en GPU \\
+\texttt{dataset.cpp}            & Carga de MNIST (formato IDX) y HASYv2 (PNG) \\
+\texttt{main\_cnn\_cuda.cu}     & Pipeline, entrenamiento, reporte HTML \\
+\texttt{linalg.h}               & Tipos Eigen (\texttt{Vector}, \texttt{Matrix}) \\
+\texttt{stb\_image.h}           & Carga de PNG/JPG (biblioteca header-only) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{ConvLayer: Forward y Backward}
+
+\subsubsection{Forward}
+
+El método \texttt{forward} sigue cuatro pasos en secuencia:
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Padding:} aplica zero-padding según \eqref{eq:same_pad}.
+  \item \textbf{Convolución:} evalúa \eqref{eq:conv} para cada filtro $f$ y cada
+    posición $(h', w')$ de la salida.
+  \item \textbf{Caché:} guarda \texttt{input\_cache\_}, \texttt{padded\_cache\_}
+    y \texttt{pre\_relu\_cache\_} ($\mathbf{Z}$) para el backward.
+  \item \textbf{ReLU:} aplica $\max(0, \cdot)$ elemento a elemento sobre $\mathbf{Z}$.
+\end{enumerate}
+
+\subsubsection{Backward}
+
+El método \texttt{backward} recibe $\partial\mathcal{L}/\partial\mathbf{A}$ y:
+
+\begin{enumerate}[noitemsep]
+  \item Deshace la ReLU multiplicando por su derivada: $\boldsymbol{\delta} =
+    \frac{\partial\mathcal{L}}{\partial\mathbf{A}} \odot \mathbf{1}[\mathbf{Z}>0]$.
+  \item Acumula el gradiente de los kernels (eq.~\eqref{eq:grad_kernel}) y actualiza
+    $\mathbf{K} \mathrel{-}= \eta \cdot \nabla_\mathbf{K}\mathcal{L}$.
+  \item Actualiza los sesgos: $b_f \mathrel{-}= \eta \cdot
+    \sum_{h',w'} \boldsymbol{\delta}[f, h', w']$.
+  \item Calcula y retorna $\partial\mathcal{L}/\partial\mathbf{X}$ mediante
+    \eqref{eq:grad_input_conv}.
+\end{enumerate}
+
+\subsection{PoolingLayer: Forward con Máscara y Backward}
+
+\subsubsection{Forward: guardado de posiciones ganadoras}
+
+\begin{lstlisting}[caption={MAX Pooling forward con máscara de posiciones ganadoras}]
+for (int c = 0; c < C; c++)
+  for (int h2 = 0; h2 < Hout; h2++)
+    for (int w2 = 0; w2 < Wout; w2++) {
+      int best_idx = 0;
+      double best_val = -1e30;
+      for (int pi = 0; pi < pool_size_; pi++)
+        for (int pj = 0; pj < pool_size_; pj++) {
+          double v = input[c][h2*s+pi][w2*s+pj];
+          if (v > best_val) {
+            best_val = v;
+            best_idx = pi * pool_size_ + pj;
+          }
+        }
+      output[c][h2][w2] = best_val;
+      mask_[c][h2][w2]  = best_idx; // indice del ganador
+    }
+\end{lstlisting}
+
+\subsubsection{Backward: enrutamiento al ganador}
+
+El gradiente se enruta exclusivamente a la posición que produjo el máximo:
+
+\begin{lstlisting}[caption={MAX Pooling backward — solo el ganador recibe gradiente}]
+for (int c = 0; c < C; c++)
+  for (int h2 = 0; h2 < Hout; h2++)
+    for (int w2 = 0; w2 < Wout; w2++) {
+      int idx = mask_[c][h2][w2];
+      int pi  = idx / pool_size_;
+      int pj  = idx % pool_size_;
+      // solo la posicion ganadora acumula el gradiente
+      grad_in[c][h2*s+pi][w2*s+pj] += grad_out[c][h2][w2];
+    }
+\end{lstlisting}
+
+\subsection{MLP\_CUDA}
+
+\subsubsection{Gestión de Memoria GPU: Patrón RAII con \texttt{GpuBuf}}
+
+La estructura \texttt{GpuBuf} encapsula un puntero a memoria GPU bajo el patrón RAII
+(\textit{Resource Acquisition Is Initialization}): la memoria se reserva en el
+constructor y se libera automáticamente en el destructor, eliminando las fugas de
+memoria de GPU:
+
+\begin{lstlisting}[caption={GpuBuf: RAII para memoria GPU}]
+struct GpuBuf {
+    float* ptr = nullptr;
+    int    n   = 0;
+
+    explicit GpuBuf(int size) : n(size) {
+        cudaMalloc(&ptr, size * sizeof(float));
+        cudaMemset(ptr, 0, size * sizeof(float));
+    }
+    ~GpuBuf() { if (ptr) cudaFree(ptr); }
+
+    // Copia prohibida: evita doble cudaFree sobre el mismo puntero
+    GpuBuf(const GpuBuf&)            = delete;
+    GpuBuf& operator=(const GpuBuf&) = delete;
+
+    // Solo movimiento: transfiere la propiedad del puntero
+    GpuBuf(GpuBuf&& o) noexcept : ptr(o.ptr), n(o.n)
+        { o.ptr = nullptr; o.n = 0; }
+};
+\end{lstlisting}
+
+\subsubsection{Kernels CUDA Implementados}
+
+\begin{table}[H]
+\centering
+\caption{Kernels CUDA del módulo \texttt{MLP\_CUDA}}
+\label{tab:kernels}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Kernel}                   & \textbf{Función} \\
+\midrule
+\texttt{kernel\_bias}             & Prepende el nodo de bias ($a_0 = 1$) al
+                                    vector de activaciones para fusionar bias
+                                    y pesos en una sola operación matricial. \\
+\texttt{kernel\_relu}             & Aplica $\max(0, x)$ elemento a elemento
+                                    (forward de capas ocultas). \\
+\texttt{kernel\_relu\_d}          & Calcula $\mathbf{1}[x > 0]$, la derivada
+                                    de ReLU usada en el backward. \\
+\texttt{kernel\_leaky\_relu}      & Aplica $x > 0 \;?\; x : \alpha x$
+                                    con $\alpha = 0.01$. \\
+\texttt{kernel\_sigmoid}          & Aplica $1/(1+e^{-x})$ (activación alternativa). \\
+\texttt{kernel\_softmax}          & Softmax numéricamente estable con reducción
+                                    paralela en shared memory. Un único bloque. \\
+\texttt{kernel\_mul\_ew}          & Producto elemento a elemento $z_i = x_i y_i$;
+                                    usado en backward para $\boldsymbol{\delta}
+                                    \odot f'(\mathbf{z})$. \\
+\texttt{kernel\_matvec\_row}      & Producto matriz-vector en row-major;
+                                    usado en backward de capas ocultas. \\
+\texttt{kernel\_ce\_deriv}        & Gradiente combinado Softmax+Cross-Entropy:
+                                    $\delta_k = \hat{y}_k - y_k$. \\
+\texttt{kernel\_sgd\_update}      & SGD: $W_{rc} \mathrel{-}= \eta\,a_r\,\delta_c$. \\
+\texttt{kernel\_adam\_update}     & Adam con momentos $m$, $v$ y corrección de
+                                    sesgo (uno por peso). \\
+\texttt{kernel\_strip\_bias\_row} & Extrae la submatriz de $W$ sin la fila del bias,
+                                    necesaria para propagar el gradiente hacia la CNN. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Softmax Numéricamente Estable con Reducción Paralela}
+
+El kernel \texttt{kernel\_softmax} implementa la forma estable de la ecuación
+\eqref{eq:conv} para la capa de salida:
+\begin{equation}
+  s_k = \frac{e^{z_k - \max_j z_j}}{\displaystyle\sum_{j=0}^{K-1} e^{z_j - \max_j z_j}}
+  \label{eq:softmax}
+\end{equation}
+
+Restar el máximo antes de calcular las exponenciales previene el desbordamiento
+(\textit{overflow}) para activaciones grandes sin cambiar el resultado matemático
+(numerador y denominador se dividen por el mismo factor $e^{\max z_j}$).
+
+Para encontrar el máximo y la suma de forma eficiente se emplea una
+\textbf{reducción paralela en árbol binario} sobre shared memory. En cada paso los
+threads activos se reducen a la mitad:
+
+\begin{lstlisting}[caption={Reducción paralela del máximo en shared memory}]
+extern __shared__ float sdata[];
+int tid = threadIdx.x;
+
+// Cada thread calcula el maximo parcial de su porcion
+float maxVal = -1e30f;
+for (int i = tid; i < n; i += blockDim.x)
+    maxVal = fmaxf(maxVal, x[i]);
+sdata[tid] = maxVal;
+__syncthreads();
+
+// Reduccion en arbol: O(log P) pasos con P = blockDim.x
+for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+    __syncthreads(); // barrera: todos los threads del bloque esperan
+}
+maxVal = sdata[0]; // maximo global disponible para todos los threads
+\end{lstlisting}
+
+La barrera \texttt{\_\_syncthreads()} garantiza que ningún thread avance al siguiente
+nivel del árbol antes de que todos hayan escrito su valor en \texttt{sdata}. La
+complejidad se reduce de $O(K)$ secuencial a $O(\log_2 P)$ pasos paralelos.
+
+\subsubsection{Gradiente Combinado Softmax + Cross-Entropy}
+
+Una ventaja algebraica clave es que la derivada combinada de la pérdida
+Cross-Entropy con activación Softmax en la capa de salida se simplifica a:
+\begin{equation}
+  \boldsymbol{\delta}^{[L]} = \frac{\partial \mathcal{L}}{\partial \mathbf{z}^{[L]}}
+  = \hat{\mathbf{y}} - \mathbf{y}
+  \label{eq:ce_softmax_grad}
+\end{equation}
+
+donde $\hat{\mathbf{y}}$ son las probabilidades predichas y $\mathbf{y}$ es el
+one-hot del target. El kernel \texttt{kernel\_ce\_deriv} implementa esta operación
+elemento a elemento en GPU, evitando calcular explícitamente el jacobiano de softmax.
+
+\subsubsection{Optimizador Adam en GPU}
+
+Adam (Adaptive Moment Estimation) adapta la tasa de aprendizaje por parámetro
+manteniendo dos momentos exponencialmente ponderados:
+\begin{align}
+  m_t &= \beta_1 m_{t-1} + (1-\beta_1)\, g_t
+        & \text{(media móvil del gradiente)}
+  \label{eq:adam_m}\\
+  v_t &= \beta_2 v_{t-1} + (1-\beta_2)\, g_t^2
+        & \text{(media móvil del cuadrado del gradiente)}
+  \label{eq:adam_v}
+\end{align}
+
+Las correcciones de sesgo compensan que $m_0 = v_0 = 0$ infla las estimaciones
+iniciales:
+\begin{equation}
+  \hat{m}_t = \frac{m_t}{1-\beta_1^t}, \qquad
+  \hat{v}_t = \frac{v_t}{1-\beta_2^t}
+  \label{eq:adam_bc}
+\end{equation}
+
+La actualización final divide el gradiente corregido por su desviación estándar
+estimada, logrando tasas de aprendizaje adaptativas:
+\begin{equation}
+  W \;\leftarrow\; W - \eta\,\frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \varepsilon}
+  \label{eq:adam_update}
+\end{equation}
+
+con $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\varepsilon = 10^{-8}$.
+Cada thread CUDA actualiza un peso de forma completamente independiente:
+
+\begin{lstlisting}[caption={Kernel Adam: un thread actualiza un peso independiente}]
+__global__ void kernel_adam_update(
+    float* W, float* mW, float* vW,
+    const float* a, const float* delta,
+    float lr, float beta1, float beta2, float eps,
+    float bc1, float bc2, int rows, int cols)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x; // fila
+    int c = blockIdx.y * blockDim.y + threadIdx.y; // columna
+    if (r < rows && c < cols) {
+        int   idx = r * cols + c;
+        float g   = a[r] * delta[c];                     // gradiente crudo
+        mW[idx]   = beta1*mW[idx] + (1.0f-beta1)*g;      // eq. (11)
+        vW[idx]   = beta2*vW[idx] + (1.0f-beta2)*g*g;    // eq. (12)
+        // bc1 = 1/(1-beta1^t), bc2 = 1/(1-beta2^t)
+        W[idx]   -= lr * (mW[idx]*bc1) /
+                    (sqrtf(vW[idx]*bc2) + eps);           // eq. (14)
+    }
+}
+\end{lstlisting}
+
+Los factores de corrección de sesgo \texttt{bc1} y \texttt{bc2} se calculan una sola
+vez en CPU antes de lanzar el kernel, eliminando la necesidad de calcular potencias
+dentro de la GPU.
+
+\subsubsection{Gradiente del Input del MLP hacia la CNN}
+
+El gradiente de la pérdida respecto al input del MLP (salida del Flatten) es:
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial \mathbf{x}_{\mathrm{flat}}}
+  = W^{[0]}_{\mathrm{sin\,bias}} \cdot \boldsymbol{\delta}^{[0]}
+  \label{eq:grad_input_mlp}
+\end{equation}
+
+donde $W^{[0]}_{\mathrm{sin\,bias}}$ es la submatriz de $W^{[0]}$ excluyendo la fila
+del nodo bias (extraída por \texttt{kernel\_strip\_bias\_row}). El kernel
+\texttt{kernel\_matvec\_row} realiza este producto en GPU y el resultado se transfiere
+a CPU en \texttt{float} para continuar el backward por la CNN.
+
+\subsubsection{Interfaz Paso a Paso para el Pipeline CNN}
+
+Para integrarse con la CNN, el MLP expone dos métodos públicos en lugar de un ciclo
+de entrenamiento autónomo:
+
+\begin{itemize}
+  \item \texttt{stepForward(x)}: recibe \texttt{vector<float>} desde el Flatten, lo
+    sube a GPU, propaga por todas las capas y devuelve las probabilidades softmax en
+    CPU.
+  \item \texttt{stepBackward(target, lr)}: recibe el one-hot del target,
+    ejecuta el backward completo actualizando los pesos del MLP, y devuelve el
+    gradiente respecto al input (vector \texttt{float}) que se pasa a la CNN.
+\end{itemize}
+
+Los buffers GPU (\texttt{step\_d\_acts\_}, \texttt{step\_d\_nets\_}, etc.) se
+inicializan una sola vez de forma \textit{lazy} en la primera llamada y se reutilizan
+en cada iteración, eliminando el costo de \texttt{cudaMalloc} por muestra.
+
+% ============================================================
+\section{Datasets}
+% ============================================================
+
+\subsection{MNIST}
+
+MNIST es el conjunto de referencia estándar para clasificación de dígitos escritos a
+mano. Contiene 60\,000 imágenes de entrenamiento y 10\,000 de prueba, cada una de
+$28 \times 28$ píxeles en escala de grises, distribuidas en 10 clases (dígitos 0--9).
+
+Las imágenes se almacenan en el \textbf{formato IDX binario}: cabecera de cuatro
+enteros de 32 bits en big-endian (\texttt{magic}, \texttt{n\_samples}, \texttt{rows},
+\texttt{cols}) seguida de los bytes de píxel. Cada píxel se normaliza al rango $[0,1]$
+dividiendo por 255 antes de alimentar la red.
+
+En la implementación se utilizan 3\,000 muestras de entrenamiento y 500 de prueba para
+agilizar el ciclo de desarrollo sin perder representatividad estadística.
+
+\subsection{HASYv2}
+
+HASYv2 es un dataset de símbolos matemáticos escritos a mano que contiene
+aproximadamente 168\,000 imágenes de $32 \times 32$ píxeles en escala de grises,
+distribuidas en \textbf{369 clases} (caracteres \LaTeX\ como $\alpha$, $\Sigma$,
+$\int$, $\infty$, $\nabla$, etc.). El dataset está organizado en 10 folds para
+validación cruzada; la implementación utiliza el fold~1.
+
+Las imágenes se almacenan como archivos PNG referenciados desde archivos CSV con el
+mapeo \texttt{path, symbol\_id, latex, user\_id}. La clase \texttt{HASYLoader}
+reconstruye el mapeo \texttt{symbol\_id}~$\to$~índice de clase a partir del archivo
+\texttt{symbols.csv}.
+
+\subsection{Jerarquía Polimórfica: \texttt{DatasetLoader}}
+
+La carga de datos se organiza con una interfaz abstracta:
+
+\begin{lstlisting}[caption={Interfaz abstracta DatasetLoader}]
+class DatasetLoader {
+public:
+    virtual ~DatasetLoader() = default;
+    virtual DatasetInfo cargar() = 0;
+};
+\end{lstlisting}
+
+Esto permite seleccionar el dataset por argumento de línea de comandos sin
+modificar el pipeline de entrenamiento. La arquitectura del MLP se ajusta
+automáticamente: para datasets con más de 100 clases (HASYv2) se usa una capa
+oculta adicional de mayor dimensión.
+
+\subsection{Mezcla Aleatoria por Época}
+
+El conjunto de entrenamiento se mezcla con \texttt{std::shuffle} antes de cada época
+usando un generador Mersenne Twister con semilla fija (\texttt{mt19937(42)}):
+
+\begin{lstlisting}[caption={Shuffle del orden de muestras por época}]
+vector<int> order(N);
+iota(order.begin(), order.end(), 0);
+shuffle(order.begin(), order.end(), local_rng);
+\end{lstlisting}
+
+La mezcla rompe las correlaciones entre muestras consecutivas, reduce el sesgo del
+gradiente estocástico y mejora la generalización del modelo. La semilla fija garantiza
+reproducibilidad entre ejecuciones.
+
+% ============================================================
+\section{Resultados}
+% ============================================================
+
+\subsection{Configuración Experimental}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parámetro}        & \textbf{MNIST}                         & \textbf{HASYv2} \\
+\midrule
+Imágenes entrenamiento     & 3\,000                                 & 5\,000 \\
+Imágenes prueba            & 500                                    & 1\,000 \\
+Tamaño imagen              & $28 \times 28$                         & $32 \times 32$ \\
+Clases                     & 10                                     & 369 \\
+Arquitectura CNN           & Conv(1$\to$32) + Conv(32$\to$64)       & Conv(1$\to$32) + Conv(32$\to$64) \\
+Arquitectura MLP           & 3136$\to$256$\to$128$\to$10            & 4096$\to$512$\to$256$\to$369 \\
+Activación oculta          & ReLU                                   & ReLU \\
+Activación salida          & Softmax                                & Softmax \\
+Inicialización             & He                                     & He \\
+Función de pérdida         & Cross-Entropy                          & Cross-Entropy \\
+Optimizador MLP            & Adam ($\eta_{\text{MLP}}=0.001$)       & Adam ($\eta_{\text{MLP}}=0.001$) \\
+Optimizador CNN            & SGD  ($\eta_{\text{CNN}}=0.001$)       & SGD  ($\eta_{\text{CNN}}=0.001$) \\
+Épocas                     & 50                                     & 50 \\
+Padding                    & SAME                                   & SAME \\
+Pooling                    & MAX $2\times2$                         & MAX $2\times2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Curvas de Aprendizaje}
+
+\todo{Insertar gráficas de pérdida (train loss) y precisión (train accuracy) por época
+para MNIST y HASYv2. Generadas por el reporte HTML del programa.}
+
+\subsection{Matriz de Confusión y Precisión por Clase}
+
+\todo{Insertar matriz de confusión y tabla de precisión por clase para MNIST (test).
+Para HASYv2 (369 clases) incluir solo la tabla de precisión por clase.}
+
+\subsection{Comparativa: MLP Puro vs CNN+MLP}
+
+\begin{table}[H]
+\centering
+\caption{Comparativa MLP puro vs CNN+MLP en MNIST (500 muestras test)}
+\label{tab:comparativa}
+\begin{tabular}{lll}
+\toprule
+\textbf{Característica}        & \textbf{MLP puro}              & \textbf{CNN+MLP} \\
+\midrule
+Input a la red                 & Píxeles crudos ($784$ dim)     & Mapa de características ($3136$ dim) \\
+Arquitectura                   & $784\to256\to128\to10$         & CNN + $3136\to256\to128\to10$ \\
+Parámetros totales             & $\sim$235\,K                   & $\sim$855\,K \\
+Extracción de características  & Ninguna                        & Automática (filtros aprendidos) \\
+Compartición de parámetros     & No                             & Sí (mismo filtro en todas las posiciones) \\
+Invarianza traslacional        & No                             & Parcial (via MAX pooling) \\
+Optimizador                    & Adam                           & Adam (MLP) + SGD (CNN) \\
+Precisión test MNIST           & $\sim$89.6\%                   & \todo{resultado} \\
+Tiempo por época (MNIST)       & \todo{resultado}               & \todo{resultado} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La ventaja principal de la CNN no reside únicamente en la precisión final, sino en su
+capacidad de aprender \textbf{representaciones jerárquicas}: la primera capa
+convolucional detecta bordes y texturas locales, la segunda combina esas características
+en patrones más complejos. El MLP opera sobre estas representaciones compactas en lugar
+de sobre los píxeles brutos, requiriendo menos capacidad para alcanzar igual o mayor
+precisión.
+
+% ============================================================
+\section{Conclusiones}
+% ============================================================
+
+\begin{enumerate}
+  \item \textbf{Compartición de parámetros:} Un filtro de $3\times3$ aplicado sobre
+    un mapa $28\times28$ utiliza solo 9 pesos para procesar 784 posiciones, frente a
+    los $784\times N_1$ pesos de una capa densa equivalente. Esto reduce el sobreajuste
+    y mejora la generalización a datos no vistos.
+
+  \item \textbf{Retropropagación end-to-end:} La implementación demuestra que el
+    gradiente puede fluir de forma continua desde la capa de salida del MLP hasta los
+    kernels de la primera capa convolucional, siguiendo el camino descrito en
+    \eqref{eq:gradient_flow}, sin necesidad de un framework de diferenciación automática.
+
+  \item \textbf{División CPU/GPU:} Mantener las capas CNN en CPU (\texttt{double}) y
+    el MLP en GPU (\texttt{float}) es un compromiso práctico que facilita la
+    implementación correcta del backward convolucional mientras aprovecha el paralelismo
+    masivo de CUDA para las operaciones densas del MLP.
+
+  \item \textbf{Softmax estable con reducción paralela:} Restar el máximo antes de
+    las exponenciales garantiza estabilidad numérica. La reducción en shared memory con
+    \texttt{\_\_syncthreads()} reduce la complejidad de $O(K)$ a $O(\log_2 P)$ pasos.
+
+  \item \textbf{Gradiente simplificado Softmax+CE:} La combinación algebraica de
+    Softmax y Cross-Entropy reduce el delta de la capa de salida a
+    $\boldsymbol{\delta}^{[L]} = \hat{\mathbf{y}} - \mathbf{y}$ (ecuación
+    \eqref{eq:ce_softmax_grad}), eliminando el cálculo explícito del jacobiano de
+    softmax.
+
+  \item \textbf{Adam vs SGD:} Adam converge más rápido para los parámetros densos del
+    MLP (muchos pesos, gradientes ruidosos). SGD es suficiente para los kernels
+    convolucionales (pocos pesos, gradientes más estables), justificando el uso de
+    optimizadores distintos en cada parte del pipeline.
+
+  \item \textbf{Patrón RAII con \texttt{GpuBuf}:} Encapsular la memoria GPU con
+    constructor/destructor y semántica de movimiento garantiza que no haya fugas de
+    memoria ni doble \texttt{cudaFree}, aplicando en CUDA los principios de gestión
+    segura de recursos de C++ moderno.
+\end{enumerate}
+
+% ============================================================
+\section*{Compilación y Ejecución}
+% ============================================================
+
+\subsubsection*{Dependencias}
+
+\begin{lstlisting}[numbers=none]
+# CUDA Toolkit >= 11 (incluye nvcc y cuBLAS)
+sudo apt install cuda-toolkit-12-x
+
+# Eigen (algebra lineal en CPU)
+sudo apt install libeigen3-dev
+
+# stb_image.h ya esta incluido en el repositorio
+\end{lstlisting}
+
+\subsubsection*{Compilación}
+
+\begin{lstlisting}[numbers=none]
+nvcc -O2 -std=c++17 -lcublas -o cnn_cuda main_cnn_cuda.cu
+\end{lstlisting}
+
+\subsubsection*{Ejecución}
+
+\begin{lstlisting}[numbers=none]
+./cnn_cuda mnist    # clasificacion de digitos 0-9
+./cnn_cuda hasy     # clasificacion de simbolos matematicos (369 clases)
+\end{lstlisting}
+
+Al finalizar el entrenamiento, el programa imprime en consola el resumen de resultados,
+la matriz de confusión (para datasets con hasta 30 clases) y el historial completo de
+pérdida y precisión por época. También genera automáticamente un reporte HTML
+interactivo con curvas de aprendizaje (Chart.js), predicciones visuales con canvas y
+matriz de confusión codificada por color.
+
+\end{document}
